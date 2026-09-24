@@ -11,7 +11,7 @@
 #
 # Env overrides:
 #   HI_BASE          — Hi platform base URL (default: https://hi.hirey.ai)
-#   SKILLS_REF       — git ref to pull SKILL.md from (default: master)
+#   SKILLS_REF       — git ref to pull SKILL.md from (default: verified 0.2.6 commit)
 #   SKILLS_DIR       — install destination (default: ~/.claude/skills)
 #   CREDS_DIR        — credentials destination (default: ~/.config/hi)
 #   HI_CHANNEL_CODE  — unsupported by the current API; a supplied value stops
@@ -31,7 +31,7 @@ SKILLS_DIR="${SKILLS_DIR:-$HOME/.claude/skills}"
 CREDS_DIR="${CREDS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/hi}"
 CREDS_FILE="$CREDS_DIR/credentials.json"
 SKILLS_REPO="hirey-ai/hirey-claude-plugin"
-SKILLS_REF="${SKILLS_REF:-master}"
+SKILLS_REF="${SKILLS_REF:-adbee73a974b269626c8a8a49f84132707cd4564}"
 RAW_BASE="https://raw.githubusercontent.com/$SKILLS_REPO/$SKILLS_REF/plugins/hirey-hi"
 
 CYAN='\033[1;36m'; GREEN='\033[1;32m'; RED='\033[1;31m'; DIM='\033[2m'; NC='\033[0m'
@@ -41,7 +41,7 @@ ok()   { printf "${GREEN}✓${NC} %s\n" "$1"; }
 fail() { printf "${RED}✗${NC} %s\n" "$1" >&2; exit 1; }
 
 # ─── Preflight ───────────────────────────────────────────────────────────
-for bin in curl jq mkdir; do
+for bin in curl jq mkdir openssl; do
   command -v "$bin" >/dev/null 2>&1 || fail "$bin not found in PATH. The Claude installer needs curl + jq.
    Install it, then re-run:
      macOS:          brew install $bin
@@ -91,21 +91,26 @@ mkdir -p "$SKILLS_DIR"
 STAGE_DIR=$(mktemp -d "$SKILLS_DIR/.hirey-stage.XXXXXX")
 CRED_TMP=""
 LOCK_OWNED=0
+RECOVERY_OWNED=0
 cleanup() {
   [ -z "$CRED_TMP" ] || rm -f "$CRED_TMP"
   rm -rf "$STAGE_DIR"
-  if [ "$LOCK_OWNED" = 1 ]; then rmdir "$LOCK_DIR" 2>/dev/null || true; fi
+  if [ "$LOCK_OWNED" = 1 ]; then
+    rm -f "$LOCK_DIR/owner.pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
+  if [ "$RECOVERY_OWNED" = 1 ]; then rmdir "$RECOVERY_LOCK" 2>/dev/null || true; fi
 }
 trap cleanup EXIT
 for name in hi-onboard hi-use hi-events hi-repair; do
   mkdir -p "$STAGE_DIR/$name"
-  curl -fsSL --connect-timeout 5 --max-time 30 "$RAW_BASE/skills/$name/SKILL.md" -o "$STAGE_DIR/$name/SKILL.md" \
+  curl -fsSL --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 1 --retry-max-time 40 "$RAW_BASE/skills/$name/SKILL.md" -o "$STAGE_DIR/$name/SKILL.md" \
     || fail "Failed to download $name SKILL.md"
 done
 
 # Reference doc that the skills link to (lazy-loaded by Claude).
 mkdir -p "$STAGE_DIR/hi-onboard/reference"
-curl -fsSL --connect-timeout 5 --max-time 30 "$RAW_BASE/reference/api.md" -o "$STAGE_DIR/hi-onboard/reference/api.md" \
+curl -fsSL --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 1 --retry-max-time 40 "$RAW_BASE/reference/api.md" -o "$STAGE_DIR/hi-onboard/reference/api.md" \
   || fail "Failed to download reference doc; installed skills unchanged"
 
 # Download every file before replacing any installed skill.
@@ -123,11 +128,40 @@ printf "    ${DIM}- hi-onboard, hi-use, hi-events, hi-repair${NC}\n"
 step "Bootstrapping anonymous Hi identity"
 mkdir -p "$CREDS_DIR" && chmod 700 "$CREDS_DIR"
 LOCK_DIR="$CREDS_DIR/.register.lock"
+RECOVERY_LOCK="$CREDS_DIR/.register-recovery.lock"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if mkdir "$LOCK_DIR" 2>/dev/null; then LOCK_OWNED=1; break; fi
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK_DIR/owner.pid"
+    LOCK_OWNED=1
+    break
+  fi
   sleep 1
 done
-[ "$LOCK_OWNED" = 1 ] || fail "hi_register_busy: installation or token refresh is already running"
+if [ "$LOCK_OWNED" != 1 ]; then
+  mkdir "$RECOVERY_LOCK" 2>/dev/null \
+    || fail "hi_register_busy: another installer or lock recovery is running; inspect $RECOVERY_LOCK if this persists"
+  RECOVERY_OWNED=1
+  [ -f "$LOCK_DIR/owner.pid" ] \
+    || fail "hi_register_lock_unknown: lock has no owner proof; inspect $LOCK_DIR before manual recovery"
+  LOCK_PID=$(cat "$LOCK_DIR/owner.pid")
+  case "$LOCK_PID" in ''|*[!0-9]*) fail "hi_register_lock_unknown: invalid lock owner; inspect $LOCK_DIR";; esac
+  if kill -0 "$LOCK_PID" 2>/dev/null; then
+    fail "hi_register_busy: installer process $LOCK_PID is still running"
+  fi
+  LOCK_MODIFIED=$(stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null) \
+    || fail "hi_register_lock_unknown: cannot determine lock age"
+  [ $(( $(date +%s) - LOCK_MODIFIED )) -ge 60 ] \
+    || fail "hi_register_busy: prior installer exited recently; retry after the 60-second recovery window"
+  [ "$(cat "$LOCK_DIR/owner.pid")" = "$LOCK_PID" ] \
+    || fail "hi_register_lock_unknown: lock owner changed during recovery"
+  rm "$LOCK_DIR/owner.pid"
+  rmdir "$LOCK_DIR" \
+    || fail "hi_register_lock_unknown: lock changed during recovery; inspect $LOCK_DIR"
+  mkdir "$LOCK_DIR" 2>/dev/null \
+    || fail "hi_register_busy: another installer acquired the recovered lock"
+  printf '%s\n' "$$" > "$LOCK_DIR/owner.pid"
+  LOCK_OWNED=1
+fi
 # Keep the same lock through credential re-read and token refresh: refreshing a
 # pending token invalidates the previous bearer for this shared installation.
 HI_BASE="${HI_BASE%/}"
@@ -167,18 +201,35 @@ fi
 if ! [ -e "$CREDS_FILE" ]; then
   # Serialize concurrent installers: two Claude sessions racing on a fresh machine would
   # otherwise each mint a separate agent. mkdir is an atomic cross-process mutex.
-  if creds_have_client_id; then
-    ok "Existing credentials at $CREDS_FILE — keeping agent_id=$(jq -r .agent_id "$CREDS_FILE")"
-  else
-    [ ! -e "$CREDS_DIR/.registration-pending.json" ] || fail "hi_registration_outcome_unknown: preserve pending marker and reconcile the previous attempt; do not register again"
     [ -z "${HI_CHANNEL_CODE:-}" ] || fail "hi_channel_attribution_unsupported: current installation API does not accept referral metadata"
-    # The server does not provide registration idempotency. Persist a non-secret
-    # fence BEFORE sending; an ambiguous response must never mint another Agent.
-    printf '%s\n' '{"status":"outcome_unknown","host":"claude"}' > "$CREDS_DIR/.registration-pending.json"
-    REG_BODY=$(jq -n --arg version "$VERSION" '{agent_type:"claude",display_name:"Claude Code (Hirey skill)",client_version:$version}')
+    PENDING_FILE="$CREDS_DIR/.registration-pending.json"
+    if [ -e "$PENDING_FILE" ]; then
+      [ -f "$PENDING_FILE" ] && [ ! -L "$PENDING_FILE" ] \
+        || fail "hi_registration_outcome_unknown: pending marker is not a regular file"
+      REG_BODY=$(jq -cer --arg base "$HI_BASE" '
+        select(.version == 1 and .base == $base and .host == "claude")
+        | .body | select(type == "object")
+        | select(.agent_type == "claude" and (.request_id | type == "string")
+          and (.pending_proof_token | type == "string") and (.client_secret | type == "string"))
+      ' "$PENDING_FILE") \
+        || fail "hi_registration_outcome_unknown: legacy or invalid marker; preserve it for manual reconciliation"
+    else
+      REG_BODY=$(jq -n --arg version "$VERSION" \
+        --arg request_id "$(openssl rand -hex 16)" \
+        --arg pending_proof_token "hi_ai_$(openssl rand -hex 32)" \
+        --arg client_secret "$(openssl rand -hex 32)" \
+        --arg occurred_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{agent_type:"claude",display_name:"Claude Code (Hirey skill)",client_version:$version,
+          request_id:$request_id,pending_proof_token:$pending_proof_token,
+          client_secret:$client_secret,occurred_at:$occurred_at}')
+      PENDING_TMP=$(mktemp "$CREDS_DIR/.registration-pending.XXXXXX")
+      jq -n --arg base "$HI_BASE" --argjson body "$REG_BODY" \
+        '{version:1,base:$base,host:"claude",body:$body}' > "$PENDING_TMP"
+      mv "$PENDING_TMP" "$PENDING_FILE"
+    fi
     REG=$(curl -fsS --connect-timeout 5 --max-time 30 -X POST "$HI_BASE/v1/agents/api-keys" \
       -H 'content-type: application/json' \
-      --data "$REG_BODY") \
+      --data-binary @- <<< "$REG_BODY") \
       || fail "hi_registration_outcome_unknown: API-key creation failed; preserve pending marker and reconcile before retry"
 
     printf '%s' "$REG" | jq -e '
@@ -186,9 +237,10 @@ if ! [ -e "$CREDS_FILE" ]; then
       and (.api_key | type == "string" and test("^hi_ak_[A-Za-z0-9_-]+$"))
     ' >/dev/null 2>&1 || { echo "hi_register_failed: invalid registration response; credentials unchanged" >&2; exit 1; }
     CRED_TMP=$(mktemp "$CREDS_DIR/.credentials.XXXXXX")
-    printf '%s' "$REG" | jq -e --arg base "$HI_BASE" '
+    printf '%s' "$REG" | jq -e --arg base "$HI_BASE" --slurpfile pending "$PENDING_FILE" '
       (.api_key | ltrimstr("hi_ak_") | gsub("-";"+") | gsub("_";"/") | @base64d | fromjson) as $key
-      | if ($key.v != 1 or ($key.id | type != "string" or length == 0) or ($key.secret | type != "string" or length == 0)) then error("invalid key") else {
+      | if ($key.v != 1 or ($key.id | type != "string" or length == 0)
+          or $key.secret != $pending[0].body.client_secret) then error("invalid key") else {
       client_id:          $key.id,
       client_secret:      $key.secret,
       agent_id:           .agent_id,
@@ -203,9 +255,8 @@ if ! [ -e "$CREDS_FILE" ]; then
     } end' > "$CRED_TMP" 2>/dev/null || fail "hi_register_failed: invalid credential envelope; reconcile pending attempt"
     mv "$CRED_TMP" "$CREDS_FILE"
     CRED_TMP=""
-    rm -f "$CREDS_DIR/.registration-pending.json"
+    rm -f "$PENDING_FILE"
     ok "Anonymous agent registered: $(jq -r .agent_id "$CREDS_FILE")"
-  fi
 else
   ok "Existing credentials at $CREDS_FILE — keeping agent_id=$(jq -r .agent_id "$CREDS_FILE")"
 fi
@@ -220,7 +271,7 @@ if [ "${HI_FORCE_TOKEN_REFRESH:-0}" = 1 ] || [ "$NOW" -ge "$EXP_AT" ]; then
   CID=$(jq -r .client_id "$CREDS_FILE")
   CSEC=$(jq -r .client_secret "$CREDS_FILE")
   AUD=$(jq -r .audience "$CREDS_FILE")
-  TOK=$(curl -fsS --connect-timeout 5 --max-time 30 -X POST "$HI_BASE/oauth/token" \
+  TOK=$(curl -fsS --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 1 --retry-max-time 40 -X POST "$HI_BASE/oauth/token" \
     --data-urlencode "grant_type=client_credentials" \
     --data-urlencode "client_id=$CID" --data-urlencode "client_secret=$CSEC" --data-urlencode "audience=$AUD") \
     || fail "Token endpoint unreachable"

@@ -41,7 +41,7 @@ curl -fsS --connect-timeout 5 --max-time 30 https://hi.hirey.ai/v1/capabilities 
 
 ## Bootstrap sequence (assistant runs all of this via Bash, no user touch)
 
-Run the script below verbatim. It reuses existing credentials and guards ambiguous first installation; the server's API-key creation endpoint itself is not idempotent. Never bypass the lock or pending fence.
+Run the script below verbatim. It reuses existing credentials and retries only an exact saved registration request. Never bypass the lock or pending marker. The replay contract requires updated Auth and Gateway services.
 
 **Referral attribution** — the current API does not accept `channel_code`. If one was supplied, stop and report unsupported attribution; do not silently discard it or claim attribution succeeded.
 
@@ -55,20 +55,55 @@ CREDS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hi"
 CREDS_FILE="$CREDS_DIR/credentials.json"
 CRED_TMP=""
 LOCK_OWNED=0
+RECOVERY_OWNED=0
 cleanup() {
   [ -z "$CRED_TMP" ] || rm -f "$CRED_TMP"
-  if [ "$LOCK_OWNED" = 1 ]; then rmdir "$LOCK_DIR" 2>/dev/null || true; fi
+  if [ "$LOCK_OWNED" = 1 ]; then
+    rm -f "$LOCK_DIR/owner.pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
+  if [ "$RECOVERY_OWNED" = 1 ]; then rmdir "$RECOVERY_LOCK" 2>/dev/null || true; fi
 }
 trap cleanup EXIT
 fail() { printf '%s\n' "$1" >&2; exit 1; }
 ok() { printf '%s\n' "$1"; }
+command -v openssl >/dev/null 2>&1 || fail "openssl is required for registration"
 mkdir -p "$CREDS_DIR" && chmod 700 "$CREDS_DIR"
 LOCK_DIR="$CREDS_DIR/.register.lock"
+RECOVERY_LOCK="$CREDS_DIR/.register-recovery.lock"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if mkdir "$LOCK_DIR" 2>/dev/null; then LOCK_OWNED=1; break; fi
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK_DIR/owner.pid"
+    LOCK_OWNED=1
+    break
+  fi
   sleep 1
 done
-[ "$LOCK_OWNED" = 1 ] || fail "hi_register_busy: installation or token refresh is already running"
+if [ "$LOCK_OWNED" != 1 ]; then
+  mkdir "$RECOVERY_LOCK" 2>/dev/null \
+    || fail "hi_register_busy: another installer or lock recovery is running; inspect $RECOVERY_LOCK if this persists"
+  RECOVERY_OWNED=1
+  [ -f "$LOCK_DIR/owner.pid" ] \
+    || fail "hi_register_lock_unknown: lock has no owner proof; inspect $LOCK_DIR before manual recovery"
+  LOCK_PID=$(cat "$LOCK_DIR/owner.pid")
+  case "$LOCK_PID" in ''|*[!0-9]*) fail "hi_register_lock_unknown: invalid lock owner; inspect $LOCK_DIR";; esac
+  if kill -0 "$LOCK_PID" 2>/dev/null; then
+    fail "hi_register_busy: installer process $LOCK_PID is still running"
+  fi
+  LOCK_MODIFIED=$(stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null) \
+    || fail "hi_register_lock_unknown: cannot determine lock age"
+  [ $(( $(date +%s) - LOCK_MODIFIED )) -ge 60 ] \
+    || fail "hi_register_busy: prior installer exited recently; retry after the 60-second recovery window"
+  [ "$(cat "$LOCK_DIR/owner.pid")" = "$LOCK_PID" ] \
+    || fail "hi_register_lock_unknown: lock owner changed during recovery"
+  rm "$LOCK_DIR/owner.pid"
+  rmdir "$LOCK_DIR" \
+    || fail "hi_register_lock_unknown: lock changed during recovery; inspect $LOCK_DIR"
+  mkdir "$LOCK_DIR" 2>/dev/null \
+    || fail "hi_register_busy: another installer acquired the recovered lock"
+  printf '%s\n' "$$" > "$LOCK_DIR/owner.pid"
+  LOCK_OWNED=1
+fi
 # Keep the same lock through credential re-read and token refresh: refreshing a
 # pending token invalidates the previous bearer for this shared installation.
 HI_BASE="${HI_BASE%/}"
@@ -108,18 +143,35 @@ fi
 if ! [ -e "$CREDS_FILE" ]; then
   # Serialize concurrent installers: two Claude sessions racing on a fresh machine would
   # otherwise each mint a separate agent. mkdir is an atomic cross-process mutex.
-  if creds_have_client_id; then
-    ok "Existing credentials at $CREDS_FILE — keeping agent_id=$(jq -r .agent_id "$CREDS_FILE")"
-  else
-    [ ! -e "$CREDS_DIR/.registration-pending.json" ] || fail "hi_registration_outcome_unknown: preserve pending marker and reconcile the previous attempt; do not register again"
     [ -z "${HI_CHANNEL_CODE:-}" ] || fail "hi_channel_attribution_unsupported: current installation API does not accept referral metadata"
-    # The server does not provide registration idempotency. Persist a non-secret
-    # fence BEFORE sending; an ambiguous response must never mint another Agent.
-    printf '%s\n' '{"status":"outcome_unknown","host":"claude"}' > "$CREDS_DIR/.registration-pending.json"
-    REG_BODY=$(jq -n --arg version "$VERSION" '{agent_type:"claude",display_name:"Claude Code (Hirey skill)",client_version:$version}')
+    PENDING_FILE="$CREDS_DIR/.registration-pending.json"
+    if [ -e "$PENDING_FILE" ]; then
+      [ -f "$PENDING_FILE" ] && [ ! -L "$PENDING_FILE" ] \
+        || fail "hi_registration_outcome_unknown: pending marker is not a regular file"
+      REG_BODY=$(jq -cer --arg base "$HI_BASE" '
+        select(.version == 1 and .base == $base and .host == "claude")
+        | .body | select(type == "object")
+        | select(.agent_type == "claude" and (.request_id | type == "string")
+          and (.pending_proof_token | type == "string") and (.client_secret | type == "string"))
+      ' "$PENDING_FILE") \
+        || fail "hi_registration_outcome_unknown: legacy or invalid marker; preserve it for manual reconciliation"
+    else
+      REG_BODY=$(jq -n --arg version "$VERSION" \
+        --arg request_id "$(openssl rand -hex 16)" \
+        --arg pending_proof_token "hi_ai_$(openssl rand -hex 32)" \
+        --arg client_secret "$(openssl rand -hex 32)" \
+        --arg occurred_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{agent_type:"claude",display_name:"Claude Code (Hirey skill)",client_version:$version,
+          request_id:$request_id,pending_proof_token:$pending_proof_token,
+          client_secret:$client_secret,occurred_at:$occurred_at}')
+      PENDING_TMP=$(mktemp "$CREDS_DIR/.registration-pending.XXXXXX")
+      jq -n --arg base "$HI_BASE" --argjson body "$REG_BODY" \
+        '{version:1,base:$base,host:"claude",body:$body}' > "$PENDING_TMP"
+      mv "$PENDING_TMP" "$PENDING_FILE"
+    fi
     REG=$(curl -fsS --connect-timeout 5 --max-time 30 -X POST "$HI_BASE/v1/agents/api-keys" \
       -H 'content-type: application/json' \
-      --data "$REG_BODY") \
+      --data-binary @- <<< "$REG_BODY") \
       || fail "hi_registration_outcome_unknown: API-key creation failed; preserve pending marker and reconcile before retry"
 
     printf '%s' "$REG" | jq -e '
@@ -127,9 +179,10 @@ if ! [ -e "$CREDS_FILE" ]; then
       and (.api_key | type == "string" and test("^hi_ak_[A-Za-z0-9_-]+$"))
     ' >/dev/null 2>&1 || { echo "hi_register_failed: invalid registration response; credentials unchanged" >&2; exit 1; }
     CRED_TMP=$(mktemp "$CREDS_DIR/.credentials.XXXXXX")
-    printf '%s' "$REG" | jq -e --arg base "$HI_BASE" '
+    printf '%s' "$REG" | jq -e --arg base "$HI_BASE" --slurpfile pending "$PENDING_FILE" '
       (.api_key | ltrimstr("hi_ak_") | gsub("-";"+") | gsub("_";"/") | @base64d | fromjson) as $key
-      | if ($key.v != 1 or ($key.id | type != "string" or length == 0) or ($key.secret | type != "string" or length == 0)) then error("invalid key") else {
+      | if ($key.v != 1 or ($key.id | type != "string" or length == 0)
+          or $key.secret != $pending[0].body.client_secret) then error("invalid key") else {
       client_id:          $key.id,
       client_secret:      $key.secret,
       agent_id:           .agent_id,
@@ -144,9 +197,8 @@ if ! [ -e "$CREDS_FILE" ]; then
     } end' > "$CRED_TMP" 2>/dev/null || fail "hi_register_failed: invalid credential envelope; reconcile pending attempt"
     mv "$CRED_TMP" "$CREDS_FILE"
     CRED_TMP=""
-    rm -f "$CREDS_DIR/.registration-pending.json"
+    rm -f "$PENDING_FILE"
     ok "Anonymous agent registered: $(jq -r .agent_id "$CREDS_FILE")"
-  fi
 else
   ok "Existing credentials at $CREDS_FILE — keeping agent_id=$(jq -r .agent_id "$CREDS_FILE")"
 fi
@@ -161,7 +213,7 @@ if [ "${HI_FORCE_TOKEN_REFRESH:-0}" = 1 ] || [ "$NOW" -ge "$EXP_AT" ]; then
   CID=$(jq -r .client_id "$CREDS_FILE")
   CSEC=$(jq -r .client_secret "$CREDS_FILE")
   AUD=$(jq -r .audience "$CREDS_FILE")
-  TOK=$(curl -fsS --connect-timeout 5 --max-time 30 -X POST "$HI_BASE/oauth/token" \
+  TOK=$(curl -fsS --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 1 --retry-max-time 40 -X POST "$HI_BASE/oauth/token" \
     --data-urlencode "grant_type=client_credentials" \
     --data-urlencode "client_id=$CID" --data-urlencode "client_secret=$CSEC" --data-urlencode "audience=$AUD") \
     || fail "Token endpoint unreachable"
@@ -185,7 +237,7 @@ printf '%s\n' 'Installation credential ready; private work still requires verifi
 
 If any step exits non-zero or returns `error` JSON, report the failed step and safe error code, without printing raw responses or credentials, and stop. Common errors:
 
-- `hi_registration_outcome_unknown` — creation may already have happened. Preserve the pending fence, stop, and reconcile; never silently retry registration.
+- `hi_registration_outcome_unknown` — the saved request failed. Preserve the pending marker and rerun the exact request after checking the service contract; legacy markers need manual reconciliation.
 - `hi_register_failed` — malformed creation response or credential envelope. Preserve the pending fence and stop; do not print the raw response.
 - `invalid_grant` from `/oauth/token` — the OAuth client was revoked/expired server-side. **Do NOT auto-delete `~/.config/hi/credentials.json`** — deleting it mints a brand-new agent and orphans the existing agent + any phone-bound workspace data. Surface the error to the user and let THEM decide: if a phone was bound, the workspace data is recoverable by re-binding the same phone on a fresh identity, so discarding creds is only safe with explicit user consent.
 - `agent_disabled` or `agent_merged` from `/v1/agents/me` or a capability call — stop and surface the server recovery guidance. Do not create a replacement Agent.
@@ -222,7 +274,7 @@ ready and that private work will require identity verification when requested.
 
 ## Installation versus verified identity
 
-Hi's `/v1/agents/api-keys` endpoint is **deliberately unauthenticated**. It returns a pending Agent and a `hi_ak_` envelope. Strictly decode its version-1 client credentials locally; do not retain or print a second copy of the API key. A `.registration-pending.json` fence survives ambiguous failures because this endpoint is not idempotent. Never remove that fence or repeat registration automatically. A successful token exchange proves installation credentials; `/v1/agents/me` requires a verified active session and must not be used as the pending-install success gate. PKCE / browser-mediated OAuth would add user friction without adding security — there's no human identity to authenticate against (each install is its own anonymous agent), and the client_secret is generated server-side, transmitted once over TLS, and stored at user 600 perms locally.
+Hi's `/v1/agents/api-keys` endpoint is **deliberately unauthenticated**. It returns a pending Agent and a `hi_ak_` envelope. Strictly decode its version-1 client credentials locally; do not retain or print a second copy of the API key. A private `.registration-pending.json` marker saves the exact registration request before transmission. An ambiguous result can retry that same request; a legacy marker without replay fields still requires manual reconciliation. A successful token exchange proves installation credentials; `/v1/agents/me` requires a verified active session and must not be used as the pending-install success gate. PKCE / browser-mediated OAuth would add user friction without adding security — there's no human identity to authenticate against (each install is its own anonymous agent), and the client_secret is generated locally, sent over TLS, and stored at user 600 perms locally.
 
 This is the same identity model OpenClaw used (client_credentials baked into local state) — we just moved the storage from `~/.openclaw/hi-mcp/<profile>/` to `~/.config/hi/credentials.json` and dropped the local stdio MCP daemon. Every Hi tool call is a direct HTTPS POST to `https://hi.hirey.ai/v1/capabilities/<id>/call`.
 

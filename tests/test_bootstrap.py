@@ -18,22 +18,36 @@ url = next(a for a in args if a.startswith("https://"))
 mode = os.environ["TEST_MODE"]
 with open(os.environ["TEST_CALLS"], "a") as f: f.write(url + "\n")
 if "raw.githubusercontent.com" in url:
+    assert "/adbee73a974b269626c8a8a49f84132707cd4564/" in url, "skills must use the verified release commit"
+    assert args[args.index("--retry") + 1] == "2"
+    assert args[args.index("--retry-max-time") + 1] == "40"
     if mode == "download_failure" and "hi-events/" in url: sys.exit(28)
     pathlib.Path(args[args.index("-o") + 1]).write_text("new skill\n")
 elif url.endswith("/api-keys"):
-    body = json.loads(args[args.index("--data") + 1])
-    assert body == {"agent_type":"claude", "display_name":"Claude Code (Hirey skill)", "client_version":"0.2.6"}
+    body = json.loads(sys.stdin.read() if "--data-binary" in args else args[args.index("--data") + 1])
+    assert {k: body[k] for k in ("agent_type", "display_name", "client_version")} == {"agent_type":"claude", "display_name":"Claude Code (Hirey skill)", "client_version":"0.2.6"}
+    replayable = "request_id" in body
+    if replayable:
+        assert len(body["request_id"]) == 32 and body["pending_proof_token"].startswith("hi_ai_")
+        assert len(body["client_secret"]) == 64 and body["occurred_at"]
+        saved = pathlib.Path(os.environ["CREDS_DIR"]) / ".fixture-registration-body"
+        if saved.exists(): assert json.loads(saved.read_text()) == body, "retry changed registration request"
+        else: saved.write_text(json.dumps(body))
+    else:
+        assert "--retry" not in args, "legacy registration must not be retried"
     if mode == "http_failure": sys.exit(22)
     if mode == "timeout": sys.exit(28)
     if mode == "bad_registration":
         print('{"error":"oops","debug":"TEST_SECRET_SENTINEL"}')
     else:
-        key = {"v": 2 if mode == "bad_key_version" else 1,"id":"client","secret":"TEST_SECRET_SENTINEL"}
+        key = {"v": 2 if mode == "bad_key_version" else 1,"id":"client","secret":body["client_secret"] if replayable else "TEST_SECRET_SENTINEL"}
         if mode == "bad_key_fields": key["secret"] = 12
         encoded = base64.urlsafe_b64encode(json.dumps(key).encode()).decode().rstrip("=")
         if mode == "bad_key_encoding": encoded = "not-json"
         print(json.dumps({"api_key":"hi_ak_"+encoded,"agent_id":"agent","status":"pending"}))
 elif url.endswith("/oauth/token"):
+    assert args[args.index("--retry") + 1] == "2"
+    assert args[args.index("--retry-max-time") + 1] == "40"
     assert (pathlib.Path(os.environ["CREDS_DIR"]) / ".register.lock").exists()
     if mode == "slow_token": time.sleep(0.25)
     if mode == "bad_token": print('{"error":"invalid_grant","debug":"TEST_SECRET_SENTINEL"}')
@@ -44,7 +58,7 @@ else: sys.exit(99)
 '''
 
 class BootstrapTests(unittest.TestCase):
-    def run_case(self, source, mode, existing=None, retry=False, channel="", parallel=False, force_refresh=False, base="https://fixture.invalid"):
+    def run_case(self, source, mode, existing=None, retry=False, channel="", parallel=False, force_refresh=False, base="https://fixture.invalid", stale_lock=False, live_lock=False, pending=False):
         with tempfile.TemporaryDirectory(prefix="hi-claude-test-") as tmp:
             task_dir = Path(tmp)
             bin_dir = task_dir / "bin"
@@ -58,6 +72,14 @@ class BootstrapTests(unittest.TestCase):
             if existing is not None:
                 creds.write_text(existing)
                 creds.chmod(0o600)
+            if stale_lock or live_lock:
+                lock = creds_dir / ".register.lock"
+                lock.mkdir()
+                (lock / "owner.pid").write_text(f"{os.getpid() if live_lock else 99999999}\n")
+                old = time.time() - 120
+                os.utime(lock, (old, old))
+            if pending:
+                (creds_dir / ".registration-pending.json").write_text('{"status":"outcome_unknown"}\n')
             skills = task_dir / "skills"
             for name in ("hi-onboard", "hi-use", "hi-events", "hi-repair"):
                 path = skills / name
@@ -97,8 +119,7 @@ class BootstrapTests(unittest.TestCase):
             if retry:
                 env["TEST_MODE"] = "ok"
                 second = subprocess.run(command, input=data, text=True, env=env, capture_output=True, timeout=15)
-                self.assertNotEqual(second.returncode, 0)
-                self.assertIn("hi_registration_outcome_unknown", second.stdout + second.stderr)
+                self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             self.assertNotIn("TEST_SECRET_SENTINEL", result.stdout + result.stderr)
             self.assertNotIn("TEST_TOKEN_SENTINEL", result.stdout + result.stderr)
             calls = (task_dir / "calls").read_text() if (task_dir / "calls").exists() else ""
@@ -106,10 +127,10 @@ class BootstrapTests(unittest.TestCase):
             permissions = (creds.stat().st_mode & 0o777) if creds.exists() else None
             old_skills = all((skills / n / "SKILL.md").read_text() == "old skill\n" for n in ("hi-onboard", "hi-use", "hi-events", "hi-repair"))
             self.assertFalse(list(creds_dir.glob(".credentials.*")))
-            self.assertFalse((creds_dir / ".register.lock").exists())
+            self.assertEqual((creds_dir / ".register.lock").exists(), live_lock)
             if retry:
-                self.assertEqual(calls.count("/api-keys"), 1)
-                self.assertTrue((creds_dir / ".registration-pending.json").exists())
+                self.assertEqual(calls.count("/api-keys"), 2)
+                self.assertFalse((creds_dir / ".registration-pending.json").exists())
             if result.returncode == 0:
                 self.assertFalse((creds_dir / ".registration-pending.json").exists())
             return result.returncode, stored, permissions, calls, old_skills
@@ -128,6 +149,27 @@ class BootstrapTests(unittest.TestCase):
             for mode in ("timeout", "http_failure", "bad_registration", "bad_key_encoding"):
                 with self.subTest(source=source, mode=mode):
                     self.run_case(source, mode, retry=True)
+
+    def test_stale_lock_recovers_without_repeating_ambiguous_registration(self):
+        existing = json.dumps({"client_id":"same-client","client_secret":"TEST_SECRET_SENTINEL","agent_id":"same-agent","audience":"hirey-hi","status":"pending"})
+        for source in ("installer", "skill"):
+            with self.subTest(source=source):
+                code, stored, _, calls, _ = self.run_case(source, "ok", existing, stale_lock=True)
+                self.assertEqual(code, 0)
+                self.assertEqual(json.loads(stored)["agent_id"], "same-agent")
+                self.assertNotIn("/api-keys", calls)
+                code, stored, _, calls, _ = self.run_case(source, "ok", stale_lock=True, pending=True)
+                self.assertNotEqual(code, 0)
+                self.assertIsNone(stored)
+                self.assertNotIn("/api-keys", calls)
+
+    def test_live_lock_is_never_recovered(self):
+        existing = json.dumps({"client_id":"same-client","client_secret":"TEST_SECRET_SENTINEL","agent_id":"same-agent","audience":"hirey-hi","status":"pending"})
+        code, stored, _, calls, _ = self.run_case("installer", "ok", existing, live_lock=True)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stored, existing)
+        self.assertNotIn("/api-keys", calls)
+        self.assertNotIn("/oauth/token", calls)
 
     def test_referral_is_not_silently_discarded(self):
         for source in ("installer", "skill"):
