@@ -46,6 +46,11 @@ elif url.endswith("/api-keys"):
         if mode == "bad_key_encoding": encoded = "not-json"
         print(json.dumps({"api_key":"hi_ak_"+encoded,"agent_id":"agent","status":"pending"}))
 elif url.endswith("/oauth/token"):
+    assert "--data-binary" in args and "--data-urlencode" not in args
+    token_body = sys.stdin.read()
+    assert token_body.startswith("grant_type=client_credentials&client_id=")
+    assert "client_secret=" in token_body and "audience=" in token_body
+    assert not any("client_secret=" in arg for arg in args), "secret exposed in process arguments"
     assert args[args.index("--retry") + 1] == "2"
     assert args[args.index("--retry-max-time") + 1] == "40"
     assert (pathlib.Path(os.environ["CREDS_DIR"]) / ".register.lock").exists()

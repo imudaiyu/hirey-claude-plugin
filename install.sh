@@ -283,18 +283,24 @@ if [ "${HI_FORCE_TOKEN_REFRESH:-0}" = 1 ] || [ "$NOW" -ge "$EXP_AT" ]; then
   CID=$(jq -r .client_id "$CREDS_FILE")
   CSEC=$(jq -r .client_secret "$CREDS_FILE")
   AUD=$(jq -r .audience "$CREDS_FILE")
-  TOK=$(curl -fsS --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 1 --retry-max-time 40 -X POST "$HI_BASE/oauth/token" \
-    --data-urlencode "grant_type=client_credentials" \
-    --data-urlencode "client_id=$CID" --data-urlencode "client_secret=$CSEC" --data-urlencode "audience=$AUD") \
+  printf '%s\n%s\n%s\n' "$CID" "$CSEC" "$AUD" \
+    | jq -Rse 'split("\n") | .[0:3] | all(test("^[A-Za-z0-9_-]+$"))' >/dev/null \
+    || fail "hi_credential_invalid: token fields must be URL-safe"
+  TOK=$(printf 'grant_type=client_credentials&client_id=%s&client_secret=%s&audience=%s' \
+    "$CID" "$CSEC" "$AUD" \
+    | curl -fsS --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 1 --retry-max-time 40 \
+      -X POST "$HI_BASE/oauth/token" -H 'content-type: application/x-www-form-urlencoded' \
+      --data-binary @-) \
     || fail "Token endpoint unreachable"
   printf '%s' "$TOK" | jq -e '(.access_token | type == "string" and length > 0) and (.expires_in | type == "number" and . > 0)' >/dev/null 2>&1 \
     || fail "hi_token_refresh_failed: invalid token response; existing credentials preserved"
   CRED_TMP=$(mktemp "$CREDS_DIR/.credentials.XXXXXX")
-  jq --argjson tok "$TOK" --arg now "$NOW" '
-    .access_token            = $tok.access_token
+  printf '%s' "$TOK" | jq --slurpfile creds "$CREDS_FILE" --arg now "$NOW" '
+    . as $tok | $creds[0]
+    | .access_token            = $tok.access_token
     | .access_token_issued_at  = ($now | tonumber)
     | .access_token_expires_in = $tok.expires_in
-  ' "$CREDS_FILE" > "$CRED_TMP"
+  ' > "$CRED_TMP"
   mv "$CRED_TMP" "$CREDS_FILE"
   CRED_TMP=""
   ok "Access token refreshed (expires in $(jq -r .access_token_expires_in "$CREDS_FILE")s)"
