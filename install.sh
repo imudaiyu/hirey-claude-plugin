@@ -219,17 +219,15 @@ if ! [ -e "$CREDS_FILE" ]; then
       ' "$PENDING_FILE") \
         || fail "hi_registration_outcome_unknown: legacy or invalid marker; preserve it for manual reconciliation"
     else
-      REG_BODY=$(jq -n --arg version "$VERSION" \
-        --arg request_id "$(openssl rand -hex 16)" \
-        --arg pending_proof_token "hi_ai_$(openssl rand -hex 32)" \
-        --arg client_secret "$(openssl rand -hex 32)" \
-        --arg occurred_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '{agent_type:"claude",display_name:"Claude Code (Hirey skill)",client_version:$version,
-          request_id:$request_id,pending_proof_token:$pending_proof_token,
-          client_secret:$client_secret,occurred_at:$occurred_at}')
+      REG_BODY=$(printf '%s\n%s\n%s\n%s\n' \
+        "$(openssl rand -hex 16)" "hi_ai_$(openssl rand -hex 32)" \
+        "$(openssl rand -hex 32)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        | jq -Rn --arg version "$VERSION" '[inputs] |
+          {agent_type:"claude",display_name:"Claude Code (Hirey skill)",client_version:$version,
+            request_id:.[0],pending_proof_token:.[1],client_secret:.[2],occurred_at:.[3]}')
       PENDING_TMP=$(mktemp "$CREDS_DIR/.registration-pending.XXXXXX")
-      jq -n --arg base "$HI_BASE" --argjson body "$REG_BODY" \
-        '{version:1,base:$base,host:"claude",body:$body}' > "$PENDING_TMP"
+      printf '%s' "$REG_BODY" | jq -c --arg base "$HI_BASE" \
+        '{version:1,base:$base,host:"claude",body:.}' > "$PENDING_TMP"
       mv "$PENDING_TMP" "$PENDING_FILE"
     fi
     REG=$(curl -fsS --connect-timeout 5 --max-time 30 -X POST "$HI_BASE/v1/agents/api-keys" \
@@ -263,6 +261,15 @@ if ! [ -e "$CREDS_FILE" ]; then
     rm -f "$PENDING_FILE"
     ok "Anonymous agent registered: $(jq -r .agent_id "$CREDS_FILE")"
 else
+  # A crash after the credential rename may leave its matching private marker.
+  # Clear only that exact completed request; preserve unrelated or legacy markers.
+  if [ -f "$CREDS_DIR/.registration-pending.json" ] && [ ! -L "$CREDS_DIR/.registration-pending.json" ] \
+    && jq -e --arg base "$HI_BASE" --slurpfile creds "$CREDS_FILE" '
+      .version == 1 and .base == $base and .host == "claude"
+      and .body.client_secret == $creds[0].client_secret
+    ' "$CREDS_DIR/.registration-pending.json" >/dev/null 2>&1; then
+    rm -f "$CREDS_DIR/.registration-pending.json"
+  fi
   ok "Existing credentials at $CREDS_FILE — keeping agent_id=$(jq -r .agent_id "$CREDS_FILE")"
 fi
 

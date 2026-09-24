@@ -79,7 +79,8 @@ class BootstrapTests(unittest.TestCase):
                 old = time.time() - 120
                 os.utime(lock, (old, old))
             if pending:
-                (creds_dir / ".registration-pending.json").write_text('{"status":"outcome_unknown"}\n')
+                (creds_dir / ".registration-pending.json").write_text(
+                    json.dumps(pending) if isinstance(pending, dict) else '{"status":"outcome_unknown"}\n')
             skills = task_dir / "skills"
             for name in ("hi-onboard", "hi-use", "hi-events", "hi-repair"):
                 path = skills / name
@@ -161,6 +162,18 @@ class BootstrapTests(unittest.TestCase):
                 code, stored, _, calls, _ = self.run_case(source, "ok", stale_lock=True, pending=True)
                 self.assertNotEqual(code, 0)
                 self.assertIsNone(stored)
+                self.assertNotIn("/api-keys", calls)
+
+    def test_completed_credential_clears_only_its_matching_marker(self):
+        existing = json.dumps({"client_id":"same-client","client_secret":"TEST_SECRET_SENTINEL",
+                               "agent_id":"same-agent","audience":"hirey-hi","status":"pending"})
+        marker = {"version": 1, "base": "https://fixture.invalid", "host": "claude",
+                  "body": {"client_secret": "TEST_SECRET_SENTINEL"}}
+        for source in ("installer", "skill"):
+            with self.subTest(source=source):
+                code, stored, _, calls, _ = self.run_case(source, "ok", existing, pending=marker)
+                self.assertEqual(code, 0)
+                self.assertEqual(json.loads(stored)["client_id"], "same-client")
                 self.assertNotIn("/api-keys", calls)
 
     def test_live_lock_is_never_recovered(self):
