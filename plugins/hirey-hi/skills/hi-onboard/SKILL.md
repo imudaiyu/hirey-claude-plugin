@@ -90,8 +90,13 @@ if [ "$LOCK_OWNED" != 1 ]; then
   if kill -0 "$LOCK_PID" 2>/dev/null; then
     fail "hi_register_busy: installer process $LOCK_PID is still running"
   fi
-  LOCK_MODIFIED=$(stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null) \
-    || fail "hi_register_lock_unknown: cannot determine lock age"
+  if [ "$(uname -s)" = Darwin ]; then
+    LOCK_MODIFIED=$(stat -f %m "$LOCK_DIR") \
+      || fail "hi_register_lock_unknown: cannot determine lock age"
+  else
+    LOCK_MODIFIED=$(stat -c %Y "$LOCK_DIR") \
+      || fail "hi_register_lock_unknown: cannot determine lock age"
+  fi
   [ $(( $(date +%s) - LOCK_MODIFIED )) -ge 60 ] \
     || fail "hi_register_busy: prior installer exited recently; retry after the 60-second recovery window"
   [ "$(cat "$LOCK_DIR/owner.pid")" = "$LOCK_PID" ] \
